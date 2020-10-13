@@ -1,0 +1,628 @@
+---
+title: "Health Insurance Cross Sell"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r,echo = FALSE, include=FALSE}
+
+set.seed(198)
+library(ROSE)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(car)
+library(e1071)
+library(data.table)
+library(dplyr)
+library(ROSE)
+library(caTools)
+library(randomForest)
+library(pROC)
+library(class)
+library(latexpdf)
+library(tinytex)
+```
+
+
+```{r}
+getwd();
+data=read.csv("train.csv", header = TRUE, na.strings = c("NA","","#NA"))
+
+```
+
+## Data preparation for prediction models
+
+### Remove "id" feature.
+```{r}
+data$id = NULL
+```
+###Encoding categorical data
+####Convert Gender, Vehicle_Age, Vehicle_Damage from categorical variables to factors
+
+```{r}
+data$Gender = factor(data$Gender,
+                         levels = c('Male', 'Female'),
+                         labels = c(1, 2))
+data$Vehicle_Age = factor(data$Vehicle_Age,
+                           levels = c('> 2 Years', '1-2 Year', '< 1 Year'),
+                           labels = c(2,1,0))
+data$Vehicle_Damage = factor(data$Vehicle_Damage,
+                             levels = c("Yes", "No"),
+                             labels = c(1,0))
+```
+
+A categorical variable can be divided into nominal categorical variable and ordinal categorical variable.Continuous class variables are the default value in R. They are stored as numeric or integer.
+
+Driving_License and Previously_Insured are nominal cateforical variables but labeled as intergers. We need to convert them into factors.
+```{r}
+data$Driving_License = as.factor(data$Driving_License)
+data$Previously_Insured = as.factor(data$Previously_Insured)
+```
+Convert numeric variables to levels of factors
+
+"Region_code's variables and  Policy_Sales_Channel's variables are in the format of numeric. However those numbers are characters. Region_Code are the 	unique code for the region of the customer; PolicySalesChannel are the	anonymized Code for the channel of outreaching to the customer ie. Different Agents, Over Mail, Over Phone, In Person, etc. So we need to convert those numerics to charactors and then group them by the frequency.
+
+```{r}
+data$Region_Code = as.factor(data$Region_Code)
+data$Policy_Sales_Channel = as.factor(data$Policy_Sales_Channel)
+```
+### Check how many levels of Region_Code
+
+
+```{r}
+levels(data$Region_Code)
+
+```
+
+There are 53 levels(0 - 52) in Region_Code. We need check the order of the frequency and group them into less levels to avoid overfitting issues when we do the modeling.
+
+```{r}
+library(ggplot2)
+```
+
+Check the frequency of each level in Region_Code
+```{r}
+g1 = ggplot(data, aes(x=character(1), fill=Region_Code))+
+   geom_bar(width=1, colour="black")+
+   coord_polar(theta="y")+
+   theme_void()
+print(g1)
+```
+
+
+```{r}
+sort(table(data$Region_Code), decreasing = TRUE)
+
+```
+
+The top 8 frequency Region_Code are "28", "8", "46", "41", "15", "30","29","50". Base on above plot and sort table we can group the Region_Code by the frequency into 9 groups including "other' group.
+
+```{r}
+library(forcats)
+```
+```{r}
+library(dplyr)
+```
+```{r}
+data$Region_Code =forcats::fct_lump_n(data$Region_Code,8, other_level = "Other")
+```
+```{r}
+levels(data$Region_Code)
+```
+
+We get 9 levels of Region_Code.
+```{r}
+g1 = ggplot(data, aes(x=factor(1), fill=Region_Code))+
+   geom_bar(width=1, colour="black")+
+   coord_polar(theta="y")+
+   theme_void()
+print(g1)
+```
+Relabel the factor levers of Region_Code
+```{r}
+data$Region_Code = factor(data$Region_Code,
+                         levels = c('15','28','29','30','41','46','50', '8', 'Other'),
+                         labels = c(1, 2,3,4,5,6,7,8,9))
+```
+```{r}
+levels(data$Region_Code)
+```
+
+ Using forcats method check the order of frequency in Policy_Sales_Channel
+```{r}
+g2 = ggplot(data, aes(x=character(1), fill=Policy_Sales_Channel))+
+   geom_bar(width=1, colour="black")+
+   coord_polar(theta="y")+
+   theme_void()
+print(g2)
+```
+
+
+
+ Base on above plot,that we can group the Policy_Sales_Channel by the frequency into 6 groups including one "Other" group.
+
+```{r}
+data$Policy_Sales_Channel =forcats::fct_lump_n(data$Policy_Sales_Channel,5, other_level = "Other")
+```
+```{r}
+g2 = ggplot(data, aes(x=factor(1), fill=Policy_Sales_Channel))+
+   geom_bar(width=1, colour="black")+
+   coord_polar(theta="y")+
+   theme_void()
+print(g2)
+```
+Relabel the levels of Policy_Sales_Channel
+
+```{r}
+data$Policy_Sales_Channel = factor(data$Policy_Sales_Channel,
+                         levels = c('124', '152','156','160', '26','Other'),
+                         labels = c(1,2,3,4,5,6))
+```
+```{r}
+levels(data$Policy_Sales_Channel)
+```
+
+
+Using Capping method to treat the Annual_Premium outliers issue.
+```{r}
+pcap <- function(x){
+  for (i in which(sapply(x, is.numeric))) {
+    quantiles <- quantile( x[,i], c(.05, .95 ), na.rm =TRUE)
+    x[,i] = ifelse(x[,i] < quantiles[1] , quantiles[1], x[,i])
+    x[,i] = ifelse(x[,i] > quantiles[2] , quantiles[2], x[,i])}
+  x}
+```
+```{r}
+data = pcap(data)
+summary(data$Annual_Premium)
+
+```
+(There is an article in a website "If you choose too large of a training set you run the risk of overfitting your model. Overfitting is a classic mistake people make when first entering the field of machine learning.")
+
+We have 381,109.00 observations we will going to only use 10% of the raw data as a model data and split the 10% into train/test datasets.
+
+```{r}
+library(caret)
+library(caTools)
+```
+Using the Partition method to get a new dataset and use the new data as a sample data to do the medolling.We will use the1% observations to do the data modeling 
+
+```{r}
+set.seed(198)
+sample_split = createDataPartition(data$Response, p = 0.1, list=FALSE)
+sampleData = data[sample_split,]
+remainData = data[-sample_split,]
+```
+```{r}
+dim(sampleData)
+dim(remainData)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+```
+
+
+convert all sampleDate factor levels to numeric so that we can scale the data to do the modelling.
+```{r}
+indx <- sapply(sampleData[], is.factor)
+sampleData[indx] <- lapply(sampleData[indx], function(x) as.numeric(as.factor(x)))
+```
+```{r}
+str(sampleData)
+```
+ convert Response to factor variables.
+```{r}
+sampleData$Response = as.factor(sampleData$Response)
+```
+```{r}
+is.factor(sampleData$Response)
+```
+
+Split the sampleDate to generate train and test dataset.We only use 20% of the sampleData as the training set. 
+
+```{r}
+set.seed(198)
+split = sample.split(sampleData$Response, SplitRatio = 0.2)
+train = subset(sampleData, split == TRUE)
+test = subset(sampleData, split == FALSE)
+```
+```{r}
+dim(train)
+dim(test)
+```
+Comparing the train dataset and original dataset
+```{r}
+
+table(data$Response)
+prop.table(table(data$Response))
+
+```
+```{r}
+table(train$Response)
+prop.table(table(train$Response))
+
+```
+
+The Percentage of customer who have positive response"1" are simily, which is 12%. So that the small sample of train set can represent the original data. We will use the train dataset to do our model.
+
+Features scaling
+
+```{r}
+train[,c(2,8,10) ] = scale(train[, c(2,8,10)])
+```
+```{r}
+str(train)
+```
+
+```{r}
+test[,c(2,8,10) ] = scale(test[, c(2,8,10)])
+```
+```{r}
+str(test)
+```
+
+
+Create  Models
+
+Logistic regression classifier model
+```{r}
+glmModel = glm(Response ~., train, family = binomial)
+```
+```{r}
+summary(glmModel)
+```
+
+Features selection
+
+Gender, Driving_License, Annual_Premium , Policy_Sales_Channel and Vintage have P_valua are much more than 0.05. We remove these four features from both the train dataset and test dataset. 
+
+```{r}
+train$Gender = NULL
+train$Driving_License = NULL
+train$Annual_Premium = NULL
+train$Policy_Sales_Channel = NULL
+train$Vintage = NULL
+
+```
+```{r}
+test$Gender = NULL
+test$Driving_License = NULL
+test$Annual_Premium = NULL
+test$Policy_Sales_Channel = NULL
+test$Vintage = NULL
+```
+
+```{r}
+dim(train)
+dim(test)
+```
+
+New GLM model
+
+```{r}
+glmNew = glm(Response ~., train, family = binomial)
+```
+
+Use the new glm model to do the probability prediction. 
+
+```{r}
+prob_pred = predict(glmNew, type = 'response', test[-6])
+```
+
+Change prob_pred percentage of probability to "1", "0" binimial number.
+```{r}
+y_pred = ifelse(prob_pred >0.5, 1, 0)
+```
+```{r}
+is.vector(y_pred)
+```
+
+```{r}
+is.atomic(test$Response)
+```
+
+ Convert "y_pred" list vector to atomic vector matching with the test$Response for comparison
+
+```{r}
+y_pred = as.character(as.numeric(as.integer(y_pred)))
+```
+```{r}
+is.atomic(y_pred)
+```
+
+```{r}
+cm = table(test[,6], y_pred)
+```
+```{r}
+cm
+```
+
+The model predict  customer responce "0", which is not interested. There is an imbalanced classification we need to adjuster the imbalance
+
+```{r}
+levels(as.factor(y_pred))
+```
+
+```{r}
+library(caret)
+```
+
+```{r}
+confusionMatrix(as.factor(y_pred), test$Response, positive = "1")
+```
+
+Althogh we got 0.8789 accuracy , however the Sensitivity is only 0.004. That means the model detect customer did not respons very well, however did not detect those customers who are interested in the cross sell. There is strong imbalance clissificaton issues . 
+
+Solve the imbalance classification
+
+
+```{r}
+library(ROSE)
+```
+Generate new balanced data by ROSE. Use Over sampling for better sensitivity
+
+```{r}
+table(train$Response)
+```
+
+```{r}
+6701*2
+```
+
+```{r}
+over = ovun.sample(Response~., data=train, method = "over", N=13402)$data
+```
+```{r}
+table(over$Response)
+```
+
+```{r}
+summary(over)
+```
+
+
+```{r}
+glm_over = glm(Response~., over, family = binomial)
+
+```
+```{r}
+dim(test)
+```
+
+```{r}
+over_pred = predict(glm_over, type = 'response', test[-6])
+```
+
+```{r}
+y_over_pred = ifelse(over_pred >0.5, 1, 0)
+```
+
+```{r}
+y_over_pred = as.factor(y_over_pred)
+```
+```{r}
+levels(y_over_pred)
+```
+```{r}
+levels(test$Response)
+```
+
+
+```{r}
+cm = table(test[,6], y_over_pred)
+```
+```{r}
+cm
+```
+
+
+```{r}
+library(caret)
+```
+
+```{r}
+confusionMatrix(as.factor(y_over_pred), test$Response, positive = "1")
+```
+
+
+0.97 Sensitivity rate. That means this model can predict 97% of those customer who are intersted the cross sell. So far we got a good model. Let try other models to see which one is fit the data most. We will focus on the model Sensitivity value, which indicate how much the percentage accuracy the model catched for those customer who is interested in the cross sell.
+
+# Apply the treated training set to other models
+
+## Random Forest Prediction
+
+
+```{r}
+library(randomForest)
+```
+
+```{r}
+set.seed(123)
+Rfmodel <- randomForest(Response ~ ., method= "anova",data=over, importance= TRUE, ntree = 100)
+
+```
+
+Predict using the test set
+
+```{r}
+plot(Rfmodel, ylim=c(0,0.36))
+legend('topright', colnames(Rfmodel$err.rate), col=1:3, fill=1:3)
+```
+
+The black line shows the overall error rate which falls around 20%%. The red and green lines show the error rate for 'not responce' and 'repsonce' respectively. Less error in prediction the "Responce" rate.
+
+
+```{r}
+set.seed(123)
+confusionMatrix(predict(Rfmodel, test), test$Response, positive = "1")
+```
+
+Sensitivity is 0.9237.
+
+
+Get features importance 
+
+```{r}
+varImpPlot(Rfmodel, main="")
+```
+
+The left figure above, is the important features order of Random Forest. Previously_Insured and Vehicle_Damage would be categorized as the most important features when predicting response. Age, Vehicle_Age and Region_code would fall under moderate importance. The right figure is the important features order of the model of logistic regression which using the Gini importance method while the Vehicle_Damage is the most importanct features.
+
+
+## Support Vector Classification (SVM_Classification)
+
+
+```{r}
+library(e1071)
+```
+```{r}
+set.seed(123)
+svm_model = svm(Response ~ ., data=over, type = 'C-classification', kernel = 'radial') 
+```
+```{r}
+predSVM <- predict(svm_model, test[-6]) 
+```
+
+```{r}
+set.seed(123)
+confusionMatrix(as.factor(predSVM), test$Response, positive = "1")
+```
+
+ Sensitivity is 0.93, close to the one of Random Forest.
+ 
+ 
+```{r}
+library(pROC)
+```
+
+
+```{r}
+roc.curve(test$Response, predSVM,plotit= TRUE, add.roc = FALSE)
+```
+
+
+## Naive Bayes Model
+
+```{r}
+library(e1071)
+```
+
+```{r}
+set.seed(123)
+naive_model=naiveBayes(Response~.,
+  data=over)
+```
+
+```{r}
+pred_nb = predict(naive_model, test[-6])
+```
+
+```{r}
+confusionMatrix(pred_nb, test$Response, positive = "1")
+```
+
+Sensitivity score is 0.9794.
+
+## Decision Tree
+
+```{r}
+library(rpart)
+```
+```{r}
+set.seed(123)
+treeModel = rpart(Response~., over  )
+```
+```{r}
+predTree = predict(treeModel, test[-6])
+```
+
+```{r}
+y_predTree = ifelse(over_pred >0.5, 1, 0)
+```
+```{r}
+library(rpart.plot)
+```
+
+```{r}
+rpart.plot(treeModel)
+```
+
+Decision Tree Model Evaluation
+
+Making the Confusion Matrix
+
+```{r}
+set.seed(123)
+confusionMatrix(as.factor(y_predTree), test$Response, positive = "1")
+```
+
+Sensitivity is 0.978.
+```{r}
+accuracy.meas(test$Response, y_predTree)
+```
+
+
+These metrics provide an interesting interpretation. With threshold value as 0.5, Precision = 0.247 says there are no false positives. Recall = 0.978 is very much high and indicates that we have lower number of false negatives as well. Threshold values can be altered also. F = 0.197 measn we have very accuracy of this model.
+
+Recall in this context is also referred to as the true positive rate or sensitivity, and precision is also referred to as positive predictive value (PPV); other related measures used in classification include true negative rate and accuracy.True negative rate is also called specificity.
+
+```{r}
+roc.curve(test$Response, y_predTree)
+```
+
+```{r}
+library(class)
+```
+
+Knn model
+```{r}
+set.seed(198)
+knn_pred = knn(train = over[,-6],
+             test = test[,-6],
+             cl = over[,6],
+              k = 4)
+```
+
+
+```{r}
+cm = table(test[, 6], knn_pred)
+cm
+```
+```{r}
+confusionMatrix(knn_pred,test$Response)
+```
+
+# Conclusion
+
+I have done the data exploration and visulization to have a basic statistc backgroud information of the data. Then did some data preparation for modeling, including check missing data, convert data variables for modeling, treat outliers issues. When do the first model, logistic regression, I found out that the model had overfitting issues and imbalanced classification. After solving these two big issues,  would be able to generate several applicable models which all have more the 93% Sensitivity rate( recall rate, true positive). Decision tree, Naive bayes and logistic Regresion have the highest True Positive Rate ( Sensitivity rate). I recommend the Insurance company use the logistic regression model due to the other two models may cost more on the daily usage in the field of business management and technical maintaining.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
